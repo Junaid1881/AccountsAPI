@@ -1,0 +1,22 @@
+version: '2'
+services: 
+  consumerdatastandards: 
+    container_name: consumerdatastandards
+    ports:
+    - port1:8080
+    env_file: 
+    - ./docker.env
+    image: imageName
+    restart: always
+    labels:
+      containertype: "generated"
+    volumes:
+    - /tmp/logs:/tmp/logs
+    logging:
+      options:
+        max-size: 10m
+        max-file: '10'
+networks:
+  default:
+    external:
+      name: sfdockerelkmaster_elk

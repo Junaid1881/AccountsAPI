@@ -1,0 +1,144 @@
+def  readconfigfile='', configserveruri='';
+def appDeployProcess;
+def props;
+def propsvault;
+node {
+
+    stage('Pulling deployment details') {
+        withCredentials([usernamePassword(credentialsId: 'demomongodb', passwordVariable: 'mongoPassword', usernameVariable: 'mongoUsername')]) {
+            try {
+                checkout scm
+                props = readProperties file: """devops/deploy.properties"""
+                withCredentials([string(credentialsId: 'vaultToken', variable: 'vaultCredentials')]) {
+                    sh """
+                        curl \
+                        --header "X-Vault-Token: ${vaultCredentials}" \
+                        --request GET \
+                        http://9.109.190.138:8200/v1/secret/data/code-engine-demo > vault.json
+                    """
+                    def json = readJSON file: 'vault.json'
+                    def data = json.data.data
+                    writeYaml file: 'credential.properties', data: data
+                }
+                propsvault = readProperties file: """credential.properties"""
+
+                //Overriding the properties if available in parameter for higher environments
+                props['configserveruri'] = "${configServerUrl}" ?: props['configserveruri']
+                echo "Using " + props['configserveruri'] + " Config server url."
+                props['defaultEnvironment'] = "${profile}" ?: props['defaultEnvironment']
+                echo "Using \"" + props['deploy.defaultEnvironment'] + "\" profile."
+                props['api.version'] = "${version}" ?: props['api.version']
+                echo "Using \"" + props['api.version'] + "\" docker version."
+
+                configserveruri = getEnvironmentConfig(props['configserveruri'], props['deploy.defaultEnvironment'])
+                readconfigfile = readJSON file: 'config.properties.json'
+            }
+            catch (e) {
+                currentBuild.result = 'FAILURE'
+                sh """rm -rf  credential.properties vault.json"""
+                echo """${e.getMessage()}"""
+                throw e
+            }
+            catch (error) {
+                currentBuild.result = 'FAILURE'
+                sh """rm -rf  credential.properties vault.json"""
+                echo """${error.getMessage()}"""
+                throw error
+            }
+        }
+    }
+
+
+    stage('Deploy to Docker ansible') {
+        try {
+            if ("""${stageExecution}""".trim().toUpperCase() != "BUILD") {
+                println "Deployment tool selected is  -> " + 'ANSIBLE'
+                println " Node name " + """${NODE_NAME}"""
+                println " Node name " + """${BUILD_TAG}"""
+                sh """
+                    sed -i "s|configserveruri|${configserveruri}|g"  devops/cd/docker.env
+                    sed -i "s|environmentprofile|${props['deploy.defaultEnvironment']}|g"  devops/cd/docker.env
+                    sed -i "s|bootstrapserver|${readconfigfile.propertySources[0].source["server.kafka.url"]}|g"  devops/cd/docker.env
+                """
+                def tempFolderName = """${BUILD_TAG}"""
+                println " tempFolderName " + """${tempFolderName}"""
+                sh """
+                    set +x
+                    echo --- > external_vars.yml
+                    echo TARGET_SERVER_IP: ${readconfigfile.propertySources[0].source["docker.environment.URL"]} > external_vars.yml
+                    echo TARGET_SERVER_PASSWORD: ${propsvault['dockerVmPassword']} >> external_vars.yml
+                    echo TARGET_SERVER_USER: ${propsvault['dockerVmUsername']} >> external_vars.yml
+                    echo API_NAME: ${props['deploy.app']} >> external_vars.yml
+                    echo REGISTRY_HOST_AND_PORT: ${props['deploy.dockerRegistry']} >> external_vars.yml
+                    echo IMAGE_TAG: ${props['api.version']} >> external_vars.yml
+                    echo PORT_TO_DEPLOY_CONTAINER: ${props['app.port']} >> external_vars.yml
+                    echo FOLDER_NAME: ${tempFolderName} >> external_vars.yml
+                    echo DYNAMIC_PORT_UPDATEA_URL: ${propsvault['runManagementIP'].trim()} >> external_vars.yml
+                    echo RUNID: ${props['run.id']} >> external_vars.yml
+                    echo IMPLEMENTATION_TYPE: ${props['api.implementation.type']} >> external_vars.yml
+                    echo PORT_TO_DEPLOY_CONTAINER_MICRO: ${props['app.httpsport']} >> external_vars.yml
+
+                    sshpass -p ${propsvault['ansiblePassword']} ssh -o StrictHostKeyChecking=no ${propsvault['ansibleUsername']}@${propsvault['ansibleIP']} mkdir /home/ibmadmin/ansibleDir/${tempFolderName}
+                    echo sshpass -p ${propsvault['ansiblePassword']} scp devops/cd/docker-playbook-template.yml ${propsvault['ansibleUsername']}@${propsvault['ansibleIP']}:/home/ibmadmin/ansibleDir/${tempFolderName}/playbook.yml >> executeDeploymentWithAnsible.sh
+                    echo sshpass -p ${propsvault['ansiblePassword']} scp devops/cd/inventory.py ${propsvault['ansibleUsername']}@${propsvault['ansibleIP']}:/home/ibmadmin/ansibleDir/${tempFolderName}/inventory.py >> executeDeploymentWithAnsible.sh
+                    echo sshpass -p ${propsvault['ansiblePassword']} scp external_vars.yml ${propsvault['ansibleUsername']}@${propsvault['ansibleIP']}:/home/ibmadmin/ansibleDir/${tempFolderName}/external_vars.yml >> executeDeploymentWithAnsible.sh
+                    echo sshpass -p ${propsvault['ansiblePassword']} scp devops/cd/docker.env ${propsvault['ansibleUsername']}@${propsvault['ansibleIP']}:/home/ibmadmin/ansibleDir/${tempFolderName}/docker.env >> executeDeploymentWithAnsible.sh
+                    echo sshpass -p ${propsvault['ansiblePassword']} ssh ${propsvault['ansibleUsername']}@${propsvault['ansibleIP']} chmod 0777 /home/ibmadmin/ansibleDir/${tempFolderName}/inventory.py >> executeDeploymentWithAnsible.sh
+                    echo sshpass -p ${propsvault['ansiblePassword']} ssh ${propsvault['ansibleUsername']}@${propsvault['ansibleIP']} ansible-playbook -i /home/ibmadmin/ansibleDir/${tempFolderName}/inventory.py /home/ibmadmin/ansibleDir/${tempFolderName}/playbook.yml >> executeDeploymentWithAnsible.sh
+                    chmod +x executeDeploymentWithAnsible.sh
+                    ./executeDeploymentWithAnsible.sh
+                """
+            }
+        }
+        catch (e) {
+            sh """rm -rf  credential.properties vault.json"""
+            currentBuild.result = 'FAILURE'
+            throw e
+        }
+        finally {
+            sh """rm devops/cd/docker-compose.yml"""
+        }
+    }
+
+
+    stage('Validate Microservice Deployment') {
+        try {
+            if ("""${stageExecution}""".trim().toUpperCase() != "BUILD") {
+                echo "Checking Microservices status"
+                //Add your helth check here
+            }
+        }
+        catch (e) {
+            currentBuild.result = 'FAILURE'
+            echo """${e.getMessage()}"""
+            sh """rm -rf  credential.properties vault.json"""
+            throw e
+        }
+        catch (error) {
+            currentBuild.result = 'UNSTABLE'
+            echo """${error.getMessage()}"""
+            sh """rm -rf  credential.properties vault.json"""
+        }
+    }
+
+
+
+
+}
+
+//getEnvironmentConfig() method declaration.
+def getEnvironmentConfig(String configUrl, String defaultEnvironment) {
+    try {
+        def configserverstatus = sh(returnStdout: true, script: """curl -s ${configUrl}/health | jq '.status' | tr -d '"' """).trim();
+        if (configserverstatus != "UP") {
+            error("""Configserver is not running  (Status:${configserverstatus})""")
+        } else {
+            sh """curl -X GET ${configUrl}/environment/${defaultEnvironment} -H 'accept: application/json' > config.properties.json"""
+            return "${configUrl}" + "/"
+        }
+    }
+    catch (error) {
+        echo """${error.getMessage()}"""
+        throw error
+    }
+}

@@ -1,0 +1,125 @@
+def workspace;
+def props='';
+def branchName;
+def commit_username;
+def commit_Email;
+def imageName;
+def dockerRegistry;
+
+node {
+    stage('Checkout Code')
+    {
+        try
+        {
+            checkout scm
+            props = readProperties  file: """devops/deploy.properties"""
+            workspace = pwd ()
+            branchName=sh(returnStdout: true, script: 'git symbolic-ref --short HEAD').trim()
+            commit_username=sh(returnStdout: true, script: '''username=$(git log -1 --pretty=%ae)
+            echo ${username%@*} ''').trim();
+            commit_Email=sh(returnStdout: true, script: '''Email=$(git log -1 --pretty=%ae)
+            echo $Email''').trim();
+            echo commit_username
+            echo commit_Email
+        } catch (e) {
+            throwError("Checkout Code",e)
+        } catch (error) {
+            currentBuild.result='FAILURE'
+            echo "Error occurred in Checkout Code stage"
+            echo """${error.getMessage()}"""
+            throw error
+        }
+    }
+
+    stage ('Build') {
+        try	{
+            sh """mvn clean compile"""
+        } catch (e) {
+            throwError("Build",e)
+        }
+    }
+
+    stage ('Unit Test Execution'){
+        try {
+            println "Unit Test Execution"
+            sh """mvn test"""
+        }catch (e) {
+            throwError("Unit Testing",e)
+        }
+    }
+				
+    stage ('Code Coverage'){
+        try {
+            def scannerHome = tool 'sonar-scanner';
+            withSonarQubeEnv('DockerSonarQube')
+            {
+                withCredentials([usernamePassword(credentialsId: 'sonarCredentials', passwordVariable: 'sonarPassword', usernameVariable: 'sonarUsername')]) {
+                    sh """
+                       ${scannerHome}/bin/sonar-scanner -D sonar.login=${sonarUsername} -D sonar.password=${sonarPassword} -D sonar.java.binaries=target/classes -D sonar.jacoco.reportPaths=target/jacoco.exec -Dproject.settings=devops/ci/sonar-project.properties
+                    """
+                }
+            }
+        }
+        catch (e) {
+            throwError("Code Coverage",e)
+        }
+    }
+
+    stage ('Static Code Analysis') {
+        try{
+            sh """echo ${workspace}"""
+            def scannerHome = tool 'sonar-scanner';
+            withSonarQubeEnv('DockerSonarQube')
+            {
+                withCredentials([usernamePassword(credentialsId: 'sonarCredentials', passwordVariable: 'sonarPassword', usernameVariable: 'sonarUsername')]) {
+                    sh """
+                            ${scannerHome}/bin/sonar-scanner -e -D sonar.login=${sonarUsername} -D sonar.password=${sonarPassword} -Dproject.settings=devops/ci/sonar-project.properties -D sonar.java.binaries=target/classes
+                    """
+                }
+            }
+        }catch (e) {
+            throwError("Static Code Analysis",e)
+        }
+    }
+
+    stage('Create Docker Image') {
+        try {
+            def date = new Date()
+            def tagVersion = """${props['api.version']}"""
+            //(date.format("yy.MM.dd.", TimeZone.getTimeZone('UTC'))) + BUILD_NUMBER
+            imageName = """${props['deploy.dockerRegistry']}/${props['deploy.app']}:${tagVersion}"""
+            latestTag = """${props['deploy.dockerRegistry']}/${props['deploy.app']}:latest"""
+            sh """
+                mvn package -DskipTests
+                sudo docker build -t ${imageName} -f devops/ci/Dockerfile .
+                sudo docker tag ${imageName} ${latestTag}
+             """
+        }
+        catch (e) {
+            throwError("Create Package", e)
+        }
+    }
+
+    stage('Push Image to Docker Registry') {
+        try {
+            sh """
+                sudo docker push ${imageName}
+                sudo docker push ${latestTag}
+                rm -rf  credential.properties vault.json
+                sudo docker rmi ${imageName}
+                sudo docker rmi ${latestTag}
+            """
+        }
+        catch (e) {
+            throwError("Moving Image to Docker Registry", e)
+        }
+    }
+
+}
+def throwError(String errMsg,e)
+{
+	currentBuild.result='FAILURE'
+	echo "Error occurred in ${errMsg} stage"
+	echo """${e.getMessage()}"""
+    throw e
+}

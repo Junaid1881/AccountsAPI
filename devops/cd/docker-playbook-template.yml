@@ -1,0 +1,309 @@
+
+- hosts: targetserver
+  remote_user: ibmadmin
+  vars_files:
+    - external_vars.yml
+  vars:
+    app_name: "{{ API_NAME }}"
+    dockerRegistryHost: "{{ REGISTRY_HOST_AND_PORT }}"
+    imageTag: "{{ IMAGE_TAG }}"
+    porttodeploy: "{{ PORT_TO_DEPLOY_CONTAINER }}"
+    foldername: "{{ FOLDER_NAME }}"
+    implementationType: "{{ IMPLEMENTATION_TYPE }}"
+    runId: "{{ RUNID }}"
+    dynamicPortUpdateURL: "{{ DYNAMIC_PORT_UPDATEA_URL }}"
+    dynamicPortUpdated: false
+    porttodeploymicro: "{{ PORT_TO_DEPLOY_CONTAINER_MICRO }}"
+
+  tasks:
+    - name: debug app_name
+      debug:
+        var: app_name
+    - name: debug REGISTRY_HOST_AND_PORT
+      debug:
+        var: dockerRegistryHost
+    - name: debug IMAGE_TAG
+      debug:
+        var: imageTag
+    - name: debug imageTag
+      debug:
+        var: porttodeploy
+    - name: debug porttodeploy
+      debug:
+        var: porttodeploy
+    - name: debug implementationType
+      debug:
+        var: implementationType
+    - name: debug porttodeploymicro
+      debug:
+        var: porttodeploymicro
+    - name: debug RUNID
+      debug:
+        var: runId        
+    - name: Check container status
+      shell: 'docker ps -a -f name={{ app_name }}'
+      register: containerstatus
+
+    - name: debug containerstatus parse
+      set_fact: 
+        datacont: "{{ containerstatus.stdout_lines | length }}"
+      when: containerstatus.stdout != ""
+      register: containerslength
+    
+    - name:  containerslength debug 1
+      debug:
+        var: datacont
+
+    - name: No container present
+      debug:
+        msg: "No container present "
+      when: datacont == "1"
+
+    - name: Container is present
+      debug:
+        msg: "Container is present "
+      when: datacont != "1"
+
+    - name: Check container status
+      shell: 'docker inspect {{ app_name }}'
+      register: containerstatus
+      when: datacont != "1"
+
+    - name: Extract output of docker inspect
+      set_fact: 
+        datacontainerOutput: "{{ containerstatus.stdout | from_json }}"
+      when: datacont != "1"
+
+    - name: Debug the status of container as it is present
+      debug:
+        msg: "{{ datacontainerOutput[0].State.Status }}"
+      when: datacont != "1"
+
+    - name: Port on which application is already deployed  
+      shell: docker inspect {{ app_name }} | jq -r '.[].NetworkSettings.Ports."8080/tcp"[].HostPort'
+      register: applicationPort
+      when: (datacont != "1") and (datacontainerOutput[0].State.Status != "exited")
+    
+    - name: Set value of springBoot running container
+      set_fact: springapplicationPort=""
+
+    - name: Set value of springBoot running container
+      set_fact: springapplicationPort={{ applicationPort.stdout }}  
+      when: (datacont != "1") and (datacontainerOutput[0].State.Status != "exited") 
+
+    - name: Port on microprofile application already running 
+      shell: docker inspect {{ app_name }} | jq -r '.[].NetworkSettings.Ports."9443/tcp"[].HostPort'  
+      register: microprofilePort
+      when: (datacont != "1") and (implementationType == "microprofile") and (datacontainerOutput[0].State.Status != "exited")
+
+    - name: Set value of microprofile running container
+      set_fact: microprofileapplicationPort=""
+      when: implementationType == "microprofile"
+
+    - name: Set value of microprofile running container
+      set_fact: microprofileapplicationPort={{ microprofilePort.stdout }} 
+      when: (datacont != "1") and (implementationType == "microprofile") and (datacontainerOutput[0].State.Status != "exited") 
+
+    - name: stop container if running
+      shell: 'docker stop {{ app_name }}'
+      register: containerStopStatus
+      when:
+        - datacont != "1"
+        - datacontainerOutput[0].State.Status == 'running'
+
+    - name: container stop status debug
+      debug:
+        var: containerStopStatus
+      when:
+        - datacont != "1"
+        - datacontainerOutput[0].State.Status == 'running'
+
+    - name: Check container status after stopping
+      shell: 'docker inspect {{ app_name }}'
+      register: containerstatusafterstopped
+      when:
+        - datacont != "1"
+
+    - name: debug containerstatus parse after stop
+      set_fact: 
+        datacontstop: "{{ containerstatusafterstopped.stdout | from_json }}"
+      when:
+        - datacont != "1"
+
+    - name: remove container if stopped
+      shell: 'docker rm {{ app_name }}'
+      register: containerRemoveStatus
+      when:
+        - datacont != "1"
+        - (datacontstop[0].State.Status == 'exited') or
+            (datacontstop[0].State.Status == 'dead') or
+            (datacontstop[0].State.Status == 'created') or
+            (datacontstop[0].State.Status == 'paused') or
+            (datacontstop[0].State.Status == 'restarting')
+
+    - name: container remove status debug
+      debug:
+        var: containerRemoveStatus
+      when:
+        - datacont != "1"
+        - (datacontstop[0].State.Status == 'exited') or
+            (datacontstop[0].State.Status == 'dead') or
+            (datacontstop[0].State.Status == 'created') or
+            (datacontstop[0].State.Status == 'paused') or
+            (datacontstop[0].State.Status == 'restarting')
+
+    - name: Removing existing app directory
+      shell: 'rm -rf home/ibmadmin/ansibleDirTarget/{{ foldername }}'
+
+    - name: Creates directory
+      file:
+        path: /home/ibmadmin/ansibleDirTarget/{{ foldername }}
+        state: directory
+
+    - name: Copying docker.env file to target
+      copy: src=/home/ibmadmin/ansibleDir/{{ foldername }}/docker.env dest=/home/ibmadmin/ansibleDirTarget/{{ foldername }}/docker.env
+    
+    # Setting dynamic http port if not present start
+    - name: setting http port to port1present
+      set_fact: port1present={{ porttodeploy }}
+
+    - name: "port1 or http is not given by user"
+      debug:
+        msg: "port1 or http is not given by user"
+      when: port1present == ""
+
+    - name: get free port1 from server
+      shell: |
+        while :
+        do
+        PORT2="`shuf -i 30020-32200 -n 1`"
+        ss -lpn | grep -q ":$PORT2 " || break
+        done
+        echo $PORT2
+      register: dynamicfreeport1
+      when: port1present == ""
+
+    - name: debug dynamicfreeport1
+      debug:
+        var: dynamicfreeport1.stdout
+      when: port1present == ""
+
+    - name: set dynamicfreeport1 as port1 or http port
+      set_fact: porttodeploy={{ dynamicfreeport1.stdout }}
+      when: (port1present == "") and (springapplicationPort | length == 0) 
+
+    - name: set the previous used port by application
+      set_fact: porttodeploy={{ springapplicationPort }}  
+      when: (port1present == "") and (springapplicationPort | length != 0)
+
+    - name: debug porttodeploy
+      debug:
+        var: porttodeploy
+    # Setting dynamic http port if not present ends
+
+    - name: Creating new container spring
+      docker_container:
+        name: '{{ app_name }}'
+        image: '{{ dockerRegistryHost }}/{{ app_name }}:{{ imageTag }}'
+        env_file: /home/ibmadmin/ansibleDirTarget/{{ foldername }}/docker.env
+        ports:
+          - '{{ porttodeploy }}:8080'
+        state: started
+        pull: yes
+        networks:
+          - name: "sfdockerelkmaster_elk"
+        volumes:
+          - /tmp/logs:/tmp/logs
+      register: containerCreationStatus
+      when: implementationType == "springboot"
+
+    - name: Debug newly created container status
+      debug:
+        var: containerCreationStatus
+      when: implementationType == "springboot"
+
+    # Setting dynamic https port if not present start
+    - name: setting https port to port2present
+      set_fact: port2present={{ porttodeploymicro }}
+
+    - name: "port2 or https is not given by user"
+      debug:
+        msg: "port2 or https is not given by user"
+      when: (port2present == "") and (implementationType == "microprofile")
+
+    - name: get free port2 from server
+      shell: |
+        while :
+        do
+        PORT2="`shuf -i 30020-32200 -n 1`"
+        ss -lpn | grep -q ":$PORT2 " || break
+        done
+        echo $PORT2
+      register: dynamicfreeport2
+      when: (port2present == "") and (implementationType == "microprofile") and (microprofileapplicationPort | length == 0)
+
+    - name: debug dynamicfreeport2
+      debug:
+        var: dynamicfreeport2.stdout
+      when: (port2present == "") and (implementationType == "microprofile") and (microprofileapplicationPort | length == 0)
+
+    - name: set dynamicfreeport2 as port2 or htts port
+      set_fact: porttodeploymicro={{ dynamicfreeport2.stdout }}
+      when: (port2present == "") and (implementationType == "microprofile") and (microprofileapplicationPort | length == 0)
+
+    - name: set the previous used port by application
+      set_fact: porttodeploy={{ microprofileapplicationPort }}  
+      when: (port2present == "") and (implementationType == "microprofile") and (microprofileapplicationPort | length != 0)
+
+    - name: debug porttodeploymicro
+      debug:
+        var: porttodeploymicro
+      when: implementationType == "microprofile"
+    # Setting dynamic https port if not present end
+
+    - name: Creating new container for microprofile
+      docker_container:
+        name: '{{ app_name }}'
+        image: '{{ dockerRegistryHost }}/{{ app_name }}:{{ imageTag }}'
+        env_file: /home/ibmadmin/ansibleDirTarget/{{ foldername }}/docker.env
+        ports:
+          - '{{ porttodeploy }}:8080'
+          - '{{ porttodeploymicro }}:9443'
+        state: started
+        pull: yes 
+        networks:
+          - name: "sfdockerelkmaster_elk"
+        volumes:
+          - /tmp/logs:/tmp/logs
+      register: containerCreationStatus
+      when: implementationType == "microprofile"
+
+    - name: Debug newly created container status
+      debug:
+        var: containerCreationStatus
+      when: implementationType == "microprofile"
+
+    - name: Updating port on which container deployed to run management endpoint or springboot
+      uri:
+        url: http://{{ dynamicPortUpdateURL }}/ports?runId={{ runId }}&httpPort={{  porttodeploy }}
+        method: PUT
+      register: postToRunID
+      when: implementationType == "springboot"
+
+    - name: Debug status of port no sent to run management springboot
+      debug:
+        var: postToRunID
+      when: implementationType == "springboot"
+
+    - name: Updating port on which container deployed to run management endpoint or microprofile
+      uri:
+        url: http://{{ dynamicPortUpdateURL }}/ports?runId={{ runId }}&httpPort={{  porttodeploy }}&httpsPort={{  porttodeploymicro }}
+        method: PUT
+      register: postToRunIDMicro
+      when: implementationType == "microprofile"
+
+    - name: Debug status of port no sent to run management microprofile
+      debug:
+        var: postToRunIDMicro
+      when: implementationType == "microprofile"
+    
